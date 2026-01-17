@@ -1,0 +1,6 @@
+# Ignore virtual environment folder
+venv/
+__pycache__/
+# Ignore uploads and frames folders
+frames/
+dummy.py
