@@ -27,8 +27,10 @@ processor = AutoProcessor.from_pretrained(
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
-    trust_remote_code=True
+    trust_remote_code=True,
+    attn_implementation="eager"   # 🔥 REQUIRED
 ).to(DEVICE).eval()
+
 
 
 def florence_caption(image_path, task="<CAPTION>"):
