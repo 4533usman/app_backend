@@ -76,10 +76,16 @@ def create_app():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(FRAMES_DIR, exist_ok=True)
 
+    # ---------------------
+    # Health Check
+    # ---------------------
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "RunPod API running"}), 200
 
+    # ---------------------
+    # Video Upload Endpoint
+    # ---------------------
     @app.route("/upload-video", methods=["POST"])
     def upload_video():
         if "video" not in request.files:
@@ -154,5 +160,32 @@ def create_app():
             "frames_saved": saved,
             "results": results
         }), 200
+
+    # ---------------------
+    # Image Upload Endpoint
+    # ---------------------
+    @app.route("/upload-image", methods=["POST"])
+    def upload_image():
+        if "image" not in request.files:
+            return jsonify({"error": "No image provided"}), 400
+
+        image_file = request.files["image"]
+        image_id = str(uuid.uuid4())
+        image_path = os.path.join(
+            UPLOAD_DIR, f"{image_id}_{image_file.filename}"
+        )
+        image_file.save(image_path)
+
+        try:
+            description = florence_caption(image_path)
+            return jsonify({
+                "image_id": image_id,
+                "description": description
+            }), 200
+        except Exception as e:
+            return jsonify({
+                "image_id": image_id,
+                "error": str(e)
+            }), 500
 
     return app
