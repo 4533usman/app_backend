@@ -28,12 +28,18 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
     trust_remote_code=True,
-    attn_implementation="eager"   # 🔥 REQUIRED
+    attn_implementation="eager"  # REQUIRED
 ).to(DEVICE).eval()
 
 
-
+# =====================
+# FLORENCE CAPTION (SAFE)
+# =====================
 def florence_caption(image_path, task="<CAPTION>"):
+    # 🔒 Validate image file
+    if not os.path.exists(image_path) or os.path.getsize(image_path) < 1024:
+        raise ValueError("Invalid or empty image file")
+
     image = Image.open(image_path).convert("RGB")
 
     inputs = processor(
@@ -56,7 +62,8 @@ def florence_caption(image_path, task="<CAPTION>"):
         )
 
     return processor.batch_decode(
-        output_ids, skip_special_tokens=True
+        output_ids,
+        skip_special_tokens=True
     )[0]
 
 
@@ -89,7 +96,8 @@ def create_app():
         frames_folder = os.path.join(FRAMES_DIR, video_id)
         os.makedirs(frames_folder, exist_ok=True)
 
-        cap = cv2.VideoCapture(video_path)
+        # 🔥 Force FFmpeg backend (CRITICAL for RunPod)
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             return jsonify({"error": "Cannot open video"}), 500
 
@@ -102,12 +110,20 @@ def create_app():
             if not ret:
                 break
 
-            if fps > 0 and frame_index % int(fps * FRAME_INTERVAL_SECONDS) == 0:
+            # 🔒 Validate frame before saving
+            if (
+                fps > 0 and
+                frame_index % int(fps * FRAME_INTERVAL_SECONDS) == 0 and
+                frame is not None and
+                frame.size > 0
+            ):
                 frame_path = os.path.join(
                     frames_folder, f"frame_{saved:05d}.jpg"
                 )
-                cv2.imwrite(frame_path, frame)
-                saved += 1
+
+                success = cv2.imwrite(frame_path, frame)
+                if success:
+                    saved += 1
 
             frame_index += 1
 
@@ -135,7 +151,7 @@ def create_app():
 
         return jsonify({
             "video_id": video_id,
-            "frames_processed": saved,
+            "frames_saved": saved,
             "results": results
         }), 200
 
