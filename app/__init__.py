@@ -56,8 +56,8 @@ def florence_caption(image_path, task="<MORE_DETAILED_CAPTION>"):
     )
 
     # Move to GPU + float16
-    inputs = {k: v.to(device=DEVICE, dtype=torch.float16) for k, v in inputs.items()}
-
+    inputs["pixel_values"] = inputs["pixel_values"].to(device=DEVICE, dtype=torch.float16)
+    inputs["input_ids"]   = inputs["input_ids"].to(device=DEVICE)   
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
@@ -94,9 +94,6 @@ def florence_caption(image_path, task="<MORE_DETAILED_CAPTION>"):
 # FLORENCE CAPTION DIRECT (for in-memory PIL Image - no file needed)
 # =====================
 def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
-    """
-    Same as florence_caption but takes PIL Image directly (no path).
-    """
     if not isinstance(pil_image, Image.Image):
         raise ValueError("Input must be a PIL Image")
 
@@ -106,7 +103,9 @@ def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
         return_tensors="pt"
     )
 
-    inputs = {k: v.to(device=DEVICE, dtype=torch.float16) for k, v in inputs.items()}
+    # This is the correct & important part
+    inputs["pixel_values"] = inputs["pixel_values"].to(device=DEVICE, dtype=torch.float16)
+    inputs["input_ids"]   = inputs["input_ids"].to(device=DEVICE)          # ← keeps torch.long !!!
 
     with torch.no_grad():
         generated_ids = model.generate(
