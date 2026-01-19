@@ -97,16 +97,19 @@ def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
     if not isinstance(pil_image, Image.Image):
         raise ValueError("Input must be a PIL Image")
 
-    inputs = processor(
-        text=task,
-        images=[pil_image],
-        return_tensors="pt"
-    )
+    # 1. Prepare inputs
+    inputs = processor(text=task, images=pil_image, return_tensors="pt")
+    
+    # Check if inputs were generated correctly to avoid 'NoneType' errors later
+    if "pixel_values" not in inputs or inputs["pixel_values"] is None:
+        raise ValueError("Processor failed to generate pixel_values from the image")
 
-    # This is the correct & important part
-    inputs["pixel_values"] = inputs["pixel_values"].to(device=DEVICE, dtype=torch.float16)
-    inputs["input_ids"]   = inputs["input_ids"].to(device=DEVICE)          # ← keeps torch.long !!!
+    # 2. Move all tensors to device and cast image to half precision (if on GPU)
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    if DEVICE.type == 'cuda':
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
 
+    # 3. Generate
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
@@ -115,23 +118,23 @@ def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
             do_sample=False
         )
 
-    generated_text = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=False
-    )[0]
+    # 4. Decode and Parse
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
 
     try:
         parsed = processor.post_process_generation(
-            generated_text,
-            task=task,
+            generated_text, 
+            task=task, 
             image_size=(pil_image.width, pil_image.height)
         )
-        if task in ["<CAPTION>", "<MORE_DETAILED_CAPTION>", "<DETAILED_CAPTION>"]:
-            return parsed[task] if task in parsed else generated_text.strip()
-        else:
-            return str(parsed)
+        # Ensure we return a string even if parsing is complex
+        if isinstance(parsed, dict) and task in parsed:
+            return parsed[task]
+        return str(parsed)
     except Exception:
+        # Fallback to simple decoding if post-processing fails
         return processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
 def create_app():
     app = Flask(__name__)
 
