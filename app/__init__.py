@@ -40,11 +40,13 @@ def florence_caption(image_path, task="<CAPTION>"):
     if not os.path.exists(image_path) or os.path.getsize(image_path) < 1024:
         raise ValueError("Invalid or empty image file")
 
+    # 🔒 Load image safely
     image = Image.open(image_path).convert("RGB")
 
+    # ✅ IMPORTANT: images MUST be a list
     inputs = processor(
         text=task,
-        images=image,
+        images=[image],   # 🔥 FIX HERE
         return_tensors="pt"
     )
 
