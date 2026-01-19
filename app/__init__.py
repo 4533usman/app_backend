@@ -231,36 +231,41 @@ def create_app():
 # ---------------------
     @app.route("/upload-image", methods=["POST"])
     def upload_image():
-        # Hardcoded image URL (examples - pick any one or make it configurable)
-        # Option 1: Serene mountain lake at sunset
-        HARDCODED_IMAGE_URL = "https://thumbs.dreamstime.com/b/majestic-mountain-vista-sunset-tranquil-landscape-painting-reflective-lake-scenery-offering-peaceful-idyllic-serene-377049392.jpg"
-        
-        # Option 2: Modern city skyline at night (uncomment if you want this)
-        # HARDCODED_IMAGE_URL = "https://thumbs.dreamstime.com/b/vibrant-city-skylines-night-modern-illuminated-lights-reflecting-water-showcasing-urban-architecture-photography-353035698.jpg"
-        
-        # Option 3: Cute cat sleeping on cozy blanket
-        # HARDCODED_IMAGE_URL = "https://thumbs.dreamstime.com/b/cute-tabby-cat-sleeping-cozy-blanket-front-warm-fireplace-creating-peaceful-comforting-winter-scene-high-392431944.jpg"
+        # Reliable, direct image URLs that ALWAYS work (no hotlink blocks in 2026)
+        HARDCODED_IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
 
-        image_id = str(uuid.uuid4())  # Still generate a fake ID for consistency
+        # Alternative good options (uncomment any one if you want to change):
+        # HARDCODED_IMAGE_URL = "https://picsum.photos/800/600"               # Random nice photo
+        # HARDCODED_IMAGE_URL = "https://images.unsplash.com/photo-1601581875039-e8c425d10e5e?w=800"
+
+        image_id = str(uuid.uuid4())
 
         try:
-            # Load image directly from URL using PIL + requests
             import requests
             from io import BytesIO
-            
-            response = requests.get(HARDCODED_IMAGE_URL, timeout=10)
-            response.raise_for_status()  # Raise error if download fails
-            
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-            
-            # Optional: Save locally if you want (for debugging)
-            # temp_path = os.path.join(UPLOAD_DIR, f"{image_id}_hardcoded.jpg")
-            # image.save(temp_path)
-            # caption = florence_caption(temp_path)
-            # os.remove(temp_path)  # clean up
-            
-            # Direct inference without saving to disk (more efficient)
-            caption = florence_caption_direct(image)  # ← New helper function below
+
+            # Download with timeout + basic headers
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(HARDCODED_IMAGE_URL, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            # Load image bytes
+            image_bytes = BytesIO(response.content)
+
+            # Step 1: Open and verify (catches invalid/corrupt downloads)
+            image = Image.open(image_bytes)
+            image.verify()  # This raises if the image is invalid/corrupt
+
+            # Step 2: Re-open safely after verification + convert to RGB
+            image_bytes.seek(0)  # Reset stream position
+            image = Image.open(image_bytes).convert("RGB")
+
+            # Optional quick check
+            if image.size[0] == 0 or image.size[1] == 0:
+                raise ValueError("Image has zero dimensions")
+
+            # Run Florence inference directly on the valid PIL image
+            caption = florence_caption_direct(image)
 
             return jsonify({
                 "image_id": image_id,
@@ -269,10 +274,17 @@ def create_app():
                 "url": HARDCODED_IMAGE_URL
             }), 200
 
+        except requests.exceptions.RequestException as req_err:
+            return jsonify({
+                "image_id": image_id,
+                "error": f"Download failed: {str(req_err)}",
+                "detail": "Could not download the image"
+            }), 500
+
         except Exception as e:
             return jsonify({
                 "image_id": image_id,
                 "error": str(e),
-                "detail": "Failed to process hardcoded image"
+                "detail": "Image validation or processing failed"
             }), 500
     return app
