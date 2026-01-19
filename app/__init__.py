@@ -231,12 +231,12 @@ def create_app():
 # ---------------------
     @app.route("/upload-image", methods=["POST"])
     def upload_image():
-        # Reliable, direct image URLs that ALWAYS work (no hotlink blocks in 2026)
-        HARDCODED_IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+        # These URLs ALWAYS serve valid JPEG (tested, no hotlink block)
+        HARDCODED_IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg?download=true"
 
-        # Alternative good options (uncomment any one if you want to change):
-        # HARDCODED_IMAGE_URL = "https://picsum.photos/800/600"               # Random nice photo
-        # HARDCODED_IMAGE_URL = "https://images.unsplash.com/photo-1601581875039-e8c425d10e5e?w=800"
+        # Alternatives if you want variety:
+        # HARDCODED_IMAGE_URL = "https://picsum.photos/800/600"               # Random high-quality photo
+        # HARDCODED_IMAGE_URL = "https://images.unsplash.com/photo-1557683316-973673baf926?w=800"  # Unsplash example
 
         image_id = str(uuid.uuid4())
 
@@ -244,27 +244,32 @@ def create_app():
             import requests
             from io import BytesIO
 
-            # Download with timeout + basic headers
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(HARDCODED_IMAGE_URL, headers=headers, timeout=15)
-            response.raise_for_status()
+            # Download
+            response = requests.get(HARDCODED_IMAGE_URL, timeout=15)
+            response.raise_for_status()  # Fail fast on 4xx/5xx
 
-            # Load image bytes
-            image_bytes = BytesIO(response.content)
+            content = response.content
+            if len(content) < 10000:  # Rough check: real JPGs are bigger
+                raise ValueError("Downloaded content too small – likely not a real image")
 
-            # Step 1: Open and verify (catches invalid/corrupt downloads)
+            image_bytes = BytesIO(content)
+
+            # Load + strict validation
             image = Image.open(image_bytes)
-            image.verify()  # This raises if the image is invalid/corrupt
+            try:
+                image.verify()  # This WILL raise if invalid/corrupt
+            except Exception as ve:
+                raise ValueError(f"Image verification failed: {str(ve)}")
 
-            # Step 2: Re-open safely after verification + convert to RGB
-            image_bytes.seek(0)  # Reset stream position
+            # Re-open safely after verify
+            image_bytes.seek(0)
             image = Image.open(image_bytes).convert("RGB")
 
-            # Optional quick check
-            if image.size[0] == 0 or image.size[1] == 0:
-                raise ValueError("Image has zero dimensions")
+            # Extra safety
+            if image.size[0] < 1 or image.size[1] < 1:
+                raise ValueError("Image has invalid (zero) dimensions")
 
-            # Run Florence inference directly on the valid PIL image
+            # Now run Florence – processor gets a real image
             caption = florence_caption_direct(image)
 
             return jsonify({
@@ -278,13 +283,20 @@ def create_app():
             return jsonify({
                 "image_id": image_id,
                 "error": f"Download failed: {str(req_err)}",
-                "detail": "Could not download the image"
+                "detail": "Network or URL issue"
             }), 500
+
+        except ValueError as val_err:
+            return jsonify({
+                "image_id": image_id,
+                "error": str(val_err),
+                "detail": "Invalid image data (corrupt, wrong format, or blocked)"
+            }), 400
 
         except Exception as e:
             return jsonify({
                 "image_id": image_id,
                 "error": str(e),
-                "detail": "Image validation or processing failed"
+                "detail": "Unexpected processing error"
             }), 500
     return app
