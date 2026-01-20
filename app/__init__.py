@@ -3,8 +3,8 @@ import os
 import uuid
 import cv2
 import torch
-from PIL import Image
 from transformers import AutoProcessor, AutoModelForCausalLM
+from PIL import Image
 
 # =====================
 # RUNPOD CONFIG
@@ -13,25 +13,25 @@ UPLOAD_DIR = "uploads"
 FRAMES_DIR = "frames"
 FRAME_INTERVAL_SECONDS = 2
 
-DEVICE = "cuda"  # RunPod = GPU only
-MODEL_ID = "microsoft/Florence-2-large"
-
 # =====================
 # LOAD FLORENCE ONCE (GPU)
 # =====================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch_dtype = torch.float16 if DEVICE.startswith("cuda") else torch.float32
+
+# ─── Most reliable loading pattern right now ───
+model = AutoModelForCausalLM.from_pretrained(
+    "microsoft/Florence-2-large",
+    torch_dtype=torch_dtype,
+    trust_remote_code=True,
+    attn_implementation="eager",           # Very important on many cloud setups
+).to(DEVICE)
+
 processor = AutoProcessor.from_pretrained(
-    MODEL_ID,
+    "microsoft/Florence-2-large",
     trust_remote_code=True
 )
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    trust_remote_code=True,
-    attn_implementation="eager"  # REQUIRED
-).to(DEVICE).eval()
-
-
 # =====================
 # FLORENCE CAPTION (SAFE)
 # =====================
@@ -97,44 +97,45 @@ def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
     if not isinstance(pil_image, Image.Image):
         raise ValueError("Input must be a PIL Image")
 
-    # 1. Prepare inputs
-    inputs = processor(text=task, images=pil_image, return_tensors="pt")
-    
-    # Check if inputs were generated correctly to avoid 'NoneType' errors later
-    if "pixel_values" not in inputs or inputs["pixel_values"] is None:
-        raise ValueError("Processor failed to generate pixel_values from the image")
+    prompt = task  # for detailed caption we usually don't need extra text
 
-    # 2. Move all tensors to device and cast image to half precision (if on GPU)
+    # Processor
+    inputs = processor(text=prompt, images=pil_image, return_tensors="pt")
+
+    if "pixel_values" not in inputs or inputs["pixel_values"] is None:
+        raise ValueError("Processor failed to generate pixel_values")
+
+    # Move to device + dtype
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-    if DEVICE.type == 'cuda':
+    if DEVICE.startswith("cuda"):
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
 
-    # 3. Generate
+    # Generate – use greedy like your local code
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
             max_new_tokens=512,
-            num_beams=3,
-            do_sample=False
+            num_beams=1,           # ← change to 1 (greedy) – more stable parsing
+            do_sample=False,
+            use_cache=False        # ← helps in some cloud setups
         )
 
-    # 4. Decode and Parse
+    # Decode with special tokens (important for post_process)
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
 
     try:
         parsed = processor.post_process_generation(
-            generated_text, 
-            task=task, 
+            generated_text,
+            task=task,
             image_size=(pil_image.width, pil_image.height)
         )
-        # Ensure we return a string even if parsing is complex
         if isinstance(parsed, dict) and task in parsed:
             return parsed[task]
         return str(parsed)
-    except Exception:
-        # Fallback to simple decoding if post-processing fails
+    except Exception as ex:
+        print(f"Post-process failed: {ex}")               # ← log this!
+        # Fallback – often still usable
         return processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-
 def create_app():
     app = Flask(__name__)
 
