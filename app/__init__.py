@@ -35,64 +35,92 @@ processor = AutoProcessor.from_pretrained(
 # =====================
 # FLORENCE CAPTION (SAFE)
 # =====================
-def florence_caption(image_path, task="<MORE_DETAILED_CAPTION>"):
+
+def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> str:
     """
-    Caption a single image with Florence-2.
-    Returns clean parsed description (recommended).
+    Caption a single frame from disk using Florence-2.
+    
+    Args:
+        frame_path: Path to the saved .jpg frame
+        task: Florence-2 task prompt (default: detailed caption)
+    
+    Returns:
+        str: Generated caption (or fallback raw text if post-processing fails)
     """
-    if not os.path.exists(image_path) or os.path.getsize(image_path) < 1024:
-        raise ValueError(f"Invalid or empty image: {image_path}")
+    if not os.path.isfile(frame_path):
+        raise FileNotFoundError(f"Frame not found: {frame_path}")
 
     try:
-        image = Image.open(image_path).convert("RGB")
+        # Load image – use RGB mode (Florence-2 expects 3 channels)
+        pil_image = Image.open(frame_path).convert("RGB")
+        
+        # Reuse your existing logic (very good & stable)
+        prompt = task
+        
+        inputs = processor(
+            text=prompt,
+            images=pil_image,
+            return_tensors="pt"
+        )
+        
+        if "pixel_values" not in inputs or inputs["pixel_values"] is None:
+            raise ValueError(f"Processor failed to extract pixel_values from {frame_path}")
+        
+        # Move to correct device + half-precision if on GPU
+        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+        if DEVICE.startswith("cuda"):
+            inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+        
+        # Generate – greedy decoding (stable, deterministic)
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                num_beams=1,          # greedy
+                do_sample=False,
+                use_cache=False       # often more stable in container/cloud envs
+            )
+        
+        # Decode including special tokens (needed for correct post-processing)
+        generated_text = processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=False
+        )[0]
+        
+        # Try structured post-processing (usually gives clean result)
+        try:
+            parsed = processor.post_process_generation(
+                generated_text,
+                task=task,
+                image_size=(pil_image.width, pil_image.height)
+            )
+            # For caption tasks → usually returns a plain string under the task key
+            if isinstance(parsed, dict) and task in parsed:
+                return parsed[task].strip()
+            # Sometimes it's already a string
+            if isinstance(parsed, str):
+                return parsed.strip()
+            return str(parsed).strip()  # fallback stringify
+            
+        except Exception as post_err:
+            print(f"Post-process failed for {frame_path}: {post_err}")
+            # Very common fallback – strip special tokens manually
+            raw_caption = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True
+            )[0].strip()
+            return raw_caption if raw_caption else "No description generated"
+
     except Exception as e:
-        raise ValueError(f"Failed to open image {image_path}: {str(e)}")
-
-    # Processor expects list for consistency (even for batch=1)
-    inputs = processor(
-        text=task,
-        images=[image],           # ← good as-is
-        return_tensors="pt"
-    )
-
-    # Move to GPU + float16
-    inputs["pixel_values"] = inputs["pixel_values"].to(device=DEVICE, dtype=torch.float16)
-    inputs["input_ids"]   = inputs["input_ids"].to(device=DEVICE)   
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=512,       # ↑ enough for detailed caption
-            num_beams=3,
-            do_sample=False
-        )
-
-    # Raw decode (with special tokens) → needed for post-processing
-    generated_text = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=False   # ← keep <loc> etc for parsing
-    )[0]
-
-    # IMPORTANT: Clean parsed output (bboxes, labels, captions, etc.)
-    try:
-        parsed = processor.post_process_generation(
-            generated_text,
-            task=task,
-            image_size=(image.width, image.height)
-        )
-        # For caption tasks → usually just a clean string
-        if task in ["<CAPTION>", "<MORE_DETAILED_CAPTION>", "<DETAILED_CAPTION>"]:
-            return parsed[task] if task in parsed else generated_text.strip()
-        else:
-            return str(parsed)  # dict for <OD>, <OCR_WITH_REGION>, etc.
-    except Exception as parse_err:
-        # Fallback if parsing fails (rare)
-        return processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        print(f"Error captioning {frame_path}: {e}")
+        return f"Error: {str(e)}"
 # =====================
 # FLASK APP (RUNPOD)
 # =====================
 # =====================
 # FLORENCE CAPTION DIRECT (for in-memory PIL Image - no file needed)
 # =====================
+
 def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
     if not isinstance(pil_image, Image.Image):
         raise ValueError("Input must be a PIL Image")
