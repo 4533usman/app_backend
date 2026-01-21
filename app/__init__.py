@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, app, request, jsonify
 import os
 import uuid
 import cv2
@@ -11,6 +11,7 @@ from openai import OpenAI
 UPLOAD_DIR = "uploads"
 FRAMES_DIR = "frames"
 TXT_DIR = "txt_outputs"
+# At the very top of the file, after imports
 FRAME_INTERVAL_SECONDS = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if DEVICE.startswith("cuda") else torch.float32
@@ -122,158 +123,101 @@ def create_app():
     def upload_video():
         if "video" not in request.files:
             return jsonify({"error": "No video provided"}), 400
+            video = request.files["video"]
+            video_id = str(uuid.uuid4())
 
-        video = request.files["video"]
-        video_id = str(uuid.uuid4())
+            video_path = os.path.join(UPLOAD_DIR, f"{video_id}_{video.filename}")
+            video.save(video_path)
 
-        video_path = os.path.join(UPLOAD_DIR, f"{video_id}_{video.filename}")
-        video.save(video_path)
+            frames_folder = os.path.join(FRAMES_DIR, video_id)
+            os.makedirs(frames_folder, exist_ok=True)
 
-        frames_folder = os.path.join(FRAMES_DIR, video_id)
-        os.makedirs(frames_folder, exist_ok=True)
+            # Step 0: Extract frames
+            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                return jsonify({"error": "Cannot open video"}), 500
 
-        # Step 0: Extract frames (your existing code)
-        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            return jsonify({"error": "Cannot open video"}), 500
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            frame_index = 0
+            saved = 0
 
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        frame_index = 0
-        saved = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if (
+                    fps > 0 and
+                    frame_index % int(fps * FRAME_INTERVAL_SECONDS) == 0 and
+                    frame is not None and
+                    frame.size > 0
+                ):
+                    frame_path = os.path.join(frames_folder, f"frame_{saved:05d}.jpg")
+                    success = cv2.imwrite(frame_path, frame)
+                    if success:
+                        saved += 1
+                frame_index += 1
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if (
-                fps > 0 and
-                frame_index % int(fps * FRAME_INTERVAL_SECONDS) == 0 and
-                frame is not None and
-                frame.size > 0
-            ):
-                frame_path = os.path.join(frames_folder, f"frame_{saved:05d}.jpg")
-                success = cv2.imwrite(frame_path, frame)
-                if success:
-                    saved += 1
-            frame_index += 1
+            cap.release()
 
-        cap.release()
+            # Step 1: Florence captions (still kept, but no TXT save)
+            florence_results = []
+            florence_success = True
 
-        # Step 1: Florence inference + check success
-        florence_results = []
-        florence_success = True  # assume success until error
-
-        for frame_file in sorted(os.listdir(frames_folder)):
-            frame_path = os.path.join(frames_folder, frame_file)
-            try:
-                caption = florence_caption(frame_path)
-                florence_results.append({
-                    "frame": frame_file,
-                    "caption": caption
-                })
-                if "Error" in caption:  # or your error check
+            for frame_file in sorted(os.listdir(frames_folder)):
+                frame_path = os.path.join(frames_folder, frame_file)
+                try:
+                    caption = florence_caption(frame_path)
+                    florence_results.append({
+                        "frame": frame_file,
+                        "caption": caption
+                    })
+                    if "Error" in caption:
+                        florence_success = False
+                except Exception as e:
+                    florence_results.append({
+                        "frame": frame_file,
+                        "error": str(e)
+                    })
                     florence_success = False
+
+            # Step 2: Whisper transcription → English only
+            whisper_transcript = "No audio or transcription available"
+            whisper_success = True
+
+            audio_path = os.path.join(UPLOAD_DIR, f"{video_id}_audio.mp3")
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vn", "-acodec", "aac", "-b:a", "128k", audio_path
+                ], check=True, capture_output=True, text=True, timeout=600)
+
+                client = OpenAI(api_key="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")
+
+                with open(audio_path, "rb") as audio_file:
+                    whisper_response = client.audio.translations.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=audio_file,
+                        response_format="text",
+                        prompt="Translate to natural English, handling Urdu-English mix."
+                    )
+                whisper_transcript = whisper_response.strip()
+
             except Exception as e:
-                florence_results.append({
-                    "frame": frame_file,
-                    "error": str(e)
-                })
-                florence_success = False
+                whisper_transcript = f"Whisper failed: {str(e)}"
+                whisper_success = False
 
-        if not florence_success:
-            return jsonify({
-                "video_id": video_id,
-                "frames_saved": saved,
-                "florence_results": florence_results,
-                "status": "Florence failed – skipping Whisper and GPT-5.2"
-            }), 200  # or 500 if you want failure status
+            # Clean up temporary audio file
+            try:
+                os.remove(audio_path)
+            except:
+                pass
 
-        # Save Florence to TXT if success
-        visual_txt_path = os.path.join(TXT_DIR, f"{video_id}_visual.txt")
-        with open(visual_txt_path, "w", encoding="utf-8") as f:
-            for res in florence_results:
-                f.write(f"{res['frame']}: {res['caption']}\n")
-
-        # Step 2: Whisper transcription (only if Florence OK)
-        whisper_transcript = "No audio or transcription available"
-        whisper_success = True
-
-        audio_path = os.path.join(UPLOAD_DIR, f"{video_id}_audio.mp3")
-        try:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", video_path,
-                "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_path
-            ], check=True, capture_output=True, timeout=600)
-
-            client = OpenAI (api_key="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")
-
-            with open(audio_path, "rb") as audio_file:
-                whisper_response = client.audio.translations.create(  # translations for English output
-                    model="gpt-4o-mini-transcribe",
-                    file=audio_file,
-                    response_format="text",
-                    prompt="Translate to natural English, handling Urdu-English mix."
-                )
-            whisper_transcript = whisper_response.strip()
-
-        except Exception as e:
-            whisper_transcript = f"Whisper failed: {str(e)}"
-            whisper_success = False
-
-        # Clean up audio
-        try:
-            os.remove(audio_path)
-        except:
-            pass
-
-        if not whisper_success:
+            # Return response with transcript (no file saving, no GPT step)
             return jsonify({
                 "video_id": video_id,
                 "frames_saved": saved,
                 "florence_results": florence_results,
                 "whisper_transcript": whisper_transcript,
-                "status": "Whisper failed – skipping GPT-5.2"
+                "status": "Processing complete" if whisper_success else "Whisper failed"
             }), 200
-
-        # Save Whisper to TXT if success
-        audio_txt_path = os.path.join(TXT_DIR, f"{video_id}_audio.txt")
-        with open(audio_txt_path, "w", encoding="utf-8") as f:
-            f.write(whisper_transcript)
-
-        # Step 3: GPT-5.2 analysis (only if both OK)
-        gpt_analysis = "GPT-5.2 analysis skipped"
-        try:
-            combined_prompt = (
-                f"Visual Description from Florence-2:\n{open(visual_txt_path, 'r').read()}\n\n"
-                f"Audio Transcript from Whisper:\n{whisper_transcript}\n\n"
-                "Based on the above video visuals and audio, provide a detailed English summary, key topics, and suggested YouTube title."
-            )
-
-            gpt_response = client.chat.completions.create(
-                model="gpt-5.2-thinking",  # or "gpt-5.2-pro" for deeper
-                messages=[
-                    {"role": "system", "content": "You are a video analyst. Combine visuals and audio for coherent insights."},
-                    {"role": "user", "content": combined_prompt}
-                ],
-                temperature=0.5,
-                max_tokens=1500
-            )
-
-            gpt_analysis = gpt_response.choices[0].message.content.strip()
-
-        except Exception as e:
-            gpt_analysis = f"GPT-5.2 failed: {str(e)}"
-
-        # Optional: clean TXT files after GPT
-        # os.remove(visual_txt_path)
-        # os.remove(audio_txt_path)
-
-        return jsonify({
-            "video_id": video_id,
-            "frames_saved": saved,
-            "florence_results": florence_results,
-            "whisper_transcript": whisper_transcript,
-            "gpt_52_analysis": gpt_analysis,
-            "status": "Full pipeline complete"
-        }), 200
     return app
