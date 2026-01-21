@@ -5,37 +5,25 @@ import cv2
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
-
-# =====================
-# RUNPOD CONFIG
-# =====================
+import subprocess
+import time
+from openai import OpenAI
 UPLOAD_DIR = "uploads"
 FRAMES_DIR = "frames"
+TXT_DIR = "txt_outputs"
 FRAME_INTERVAL_SECONDS = 2
-
-# =====================
-# LOAD FLORENCE ONCE (GPU)
-# =====================
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if DEVICE.startswith("cuda") else torch.float32
-
-# ─── Most reliable loading pattern right now ───
 model = AutoModelForCausalLM.from_pretrained(
     "microsoft/Florence-2-large",
     torch_dtype=torch_dtype,
     trust_remote_code=True,
     attn_implementation="eager",           # Very important on many cloud setups
 ).to(DEVICE)
-
 processor = AutoProcessor.from_pretrained(
     "microsoft/Florence-2-large",
     trust_remote_code=True
 )
-# =====================
-# FLORENCE CAPTION (SAFE)
-# =====================
-
 def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> str:
     """
     Caption a single frame from disk using Florence-2.
@@ -114,56 +102,6 @@ def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> 
     except Exception as e:
         print(f"Error captioning {frame_path}: {e}")
         return f"Error: {str(e)}"
-# =====================
-# FLASK APP (RUNPOD)
-# =====================
-# =====================
-# FLORENCE CAPTION DIRECT (for in-memory PIL Image - no file needed)
-# =====================
-
-def florence_caption_direct(pil_image, task="<MORE_DETAILED_CAPTION>"):
-    if not isinstance(pil_image, Image.Image):
-        raise ValueError("Input must be a PIL Image")
-
-    prompt = task  # for detailed caption we usually don't need extra text
-
-    # Processor
-    inputs = processor(text=prompt, images=pil_image, return_tensors="pt")
-
-    if "pixel_values" not in inputs or inputs["pixel_values"] is None:
-        raise ValueError("Processor failed to generate pixel_values")
-
-    # Move to device + dtype
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-    if DEVICE.startswith("cuda"):
-        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
-
-    # Generate – use greedy like your local code
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            num_beams=1,           # ← change to 1 (greedy) – more stable parsing
-            do_sample=False,
-            use_cache=False        # ← helps in some cloud setups
-        )
-
-    # Decode with special tokens (important for post_process)
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-
-    try:
-        parsed = processor.post_process_generation(
-            generated_text,
-            task=task,
-            image_size=(pil_image.width, pil_image.height)
-        )
-        if isinstance(parsed, dict) and task in parsed:
-            return parsed[task]
-        return str(parsed)
-    except Exception as ex:
-        print(f"Post-process failed: {ex}")               # ← log this!
-        # Fallback – often still usable
-        return processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 def create_app():
     app = Flask(__name__)
 
@@ -188,15 +126,13 @@ def create_app():
         video = request.files["video"]
         video_id = str(uuid.uuid4())
 
-        video_path = os.path.join(
-            UPLOAD_DIR, f"{video_id}_{video.filename}"
-        )
+        video_path = os.path.join(UPLOAD_DIR, f"{video_id}_{video.filename}")
         video.save(video_path)
 
         frames_folder = os.path.join(FRAMES_DIR, video_id)
         os.makedirs(frames_folder, exist_ok=True)
 
-        # 🔥 Force FFmpeg backend (CRITICAL for RunPod)
+        # Step 0: Extract frames (your existing code)
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             return jsonify({"error": "Cannot open video"}), 500
@@ -209,126 +145,135 @@ def create_app():
             ret, frame = cap.read()
             if not ret:
                 break
-
-            # 🔒 Validate frame before saving
             if (
                 fps > 0 and
                 frame_index % int(fps * FRAME_INTERVAL_SECONDS) == 0 and
                 frame is not None and
                 frame.size > 0
             ):
-                frame_path = os.path.join(
-                    frames_folder, f"frame_{saved:05d}.jpg"
-                )
-
+                frame_path = os.path.join(frames_folder, f"frame_{saved:05d}.jpg")
                 success = cv2.imwrite(frame_path, frame)
                 if success:
                     saved += 1
-
             frame_index += 1
 
         cap.release()
 
-        # =====================
-        # FLORENCE INFERENCE
-        # =====================
-        results = []
+        # Step 1: Florence inference + check success
+        florence_results = []
+        florence_success = True  # assume success until error
 
         for frame_file in sorted(os.listdir(frames_folder)):
             frame_path = os.path.join(frames_folder, frame_file)
-
             try:
                 caption = florence_caption(frame_path)
-                results.append({
+                florence_results.append({
                     "frame": frame_file,
                     "caption": caption
                 })
+                if "Error" in caption:  # or your error check
+                    florence_success = False
             except Exception as e:
-                results.append({
+                florence_results.append({
                     "frame": frame_file,
                     "error": str(e)
                 })
+                florence_success = False
+
+        if not florence_success:
+            return jsonify({
+                "video_id": video_id,
+                "frames_saved": saved,
+                "florence_results": florence_results,
+                "status": "Florence failed – skipping Whisper and GPT-5.2"
+            }), 200  # or 500 if you want failure status
+
+        # Save Florence to TXT if success
+        visual_txt_path = os.path.join(TXT_DIR, f"{video_id}_visual.txt")
+        with open(visual_txt_path, "w", encoding="utf-8") as f:
+            for res in florence_results:
+                f.write(f"{res['frame']}: {res['caption']}\n")
+
+        # Step 2: Whisper transcription (only if Florence OK)
+        whisper_transcript = "No audio or transcription available"
+        whisper_success = True
+
+        audio_path = os.path.join(UPLOAD_DIR, f"{video_id}_audio.mp3")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_path
+            ], check=True, capture_output=True, timeout=600)
+
+            client = OpenAI (api_key="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")
+
+            with open(audio_path, "rb") as audio_file:
+                whisper_response = client.audio.translations.create(  # translations for English output
+                    model="gpt-4o-mini-transcribe",
+                    file=audio_file,
+                    response_format="text",
+                    prompt="Translate to natural English, handling Urdu-English mix."
+                )
+            whisper_transcript = whisper_response.strip()
+
+        except Exception as e:
+            whisper_transcript = f"Whisper failed: {str(e)}"
+            whisper_success = False
+
+        # Clean up audio
+        try:
+            os.remove(audio_path)
+        except:
+            pass
+
+        if not whisper_success:
+            return jsonify({
+                "video_id": video_id,
+                "frames_saved": saved,
+                "florence_results": florence_results,
+                "whisper_transcript": whisper_transcript,
+                "status": "Whisper failed – skipping GPT-5.2"
+            }), 200
+
+        # Save Whisper to TXT if success
+        audio_txt_path = os.path.join(TXT_DIR, f"{video_id}_audio.txt")
+        with open(audio_txt_path, "w", encoding="utf-8") as f:
+            f.write(whisper_transcript)
+
+        # Step 3: GPT-5.2 analysis (only if both OK)
+        gpt_analysis = "GPT-5.2 analysis skipped"
+        try:
+            combined_prompt = (
+                f"Visual Description from Florence-2:\n{open(visual_txt_path, 'r').read()}\n\n"
+                f"Audio Transcript from Whisper:\n{whisper_transcript}\n\n"
+                "Based on the above video visuals and audio, provide a detailed English summary, key topics, and suggested YouTube title."
+            )
+
+            gpt_response = client.chat.completions.create(
+                model="gpt-5.2-thinking",  # or "gpt-5.2-pro" for deeper
+                messages=[
+                    {"role": "system", "content": "You are a video analyst. Combine visuals and audio for coherent insights."},
+                    {"role": "user", "content": combined_prompt}
+                ],
+                temperature=0.5,
+                max_tokens=1500
+            )
+
+            gpt_analysis = gpt_response.choices[0].message.content.strip()
+
+        except Exception as e:
+            gpt_analysis = f"GPT-5.2 failed: {str(e)}"
+
+        # Optional: clean TXT files after GPT
+        # os.remove(visual_txt_path)
+        # os.remove(audio_txt_path)
 
         return jsonify({
             "video_id": video_id,
             "frames_saved": saved,
-            "results": results
+            "florence_results": florence_results,
+            "whisper_transcript": whisper_transcript,
+            "gpt_52_analysis": gpt_analysis,
+            "status": "Full pipeline complete"
         }), 200
-
-    # ---------------------
-    # Image Upload Endpoint
-    # ---------------------
-    # ---------------------
-# Image Upload Endpoint (Now Hardcoded Image - No Upload Required)
-# ---------------------
-    @app.route("/upload-image", methods=["POST"])
-    def upload_image():
-        # These URLs ALWAYS serve valid JPEG (tested, no hotlink block)
-        HARDCODED_IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg?download=true"
-
-        # Alternatives if you want variety:
-        # HARDCODED_IMAGE_URL = "https://picsum.photos/800/600"               # Random high-quality photo
-        # HARDCODED_IMAGE_URL = "https://images.unsplash.com/photo-1557683316-973673baf926?w=800"  # Unsplash example
-
-        image_id = str(uuid.uuid4())
-
-        try:
-            import requests
-            from io import BytesIO
-
-            # Download
-            response = requests.get(HARDCODED_IMAGE_URL, timeout=15)
-            response.raise_for_status()  # Fail fast on 4xx/5xx
-
-            content = response.content
-            if len(content) < 10000:  # Rough check: real JPGs are bigger
-                raise ValueError("Downloaded content too small – likely not a real image")
-
-            image_bytes = BytesIO(content)
-
-            # Load + strict validation
-            image = Image.open(image_bytes)
-            try:
-                image.verify()  # This WILL raise if invalid/corrupt
-            except Exception as ve:
-                raise ValueError(f"Image verification failed: {str(ve)}")
-
-            # Re-open safely after verify
-            image_bytes.seek(0)
-            image = Image.open(image_bytes).convert("RGB")
-
-            # Extra safety
-            if image.size[0] < 1 or image.size[1] < 1:
-                raise ValueError("Image has invalid (zero) dimensions")
-
-            # Now run Florence – processor gets a real image
-            caption = florence_caption_direct(image)
-
-            return jsonify({
-                "image_id": image_id,
-                "description": caption,
-                "source": "hardcoded_url",
-                "url": HARDCODED_IMAGE_URL
-            }), 200
-
-        except requests.exceptions.RequestException as req_err:
-            return jsonify({
-                "image_id": image_id,
-                "error": f"Download failed: {str(req_err)}",
-                "detail": "Network or URL issue"
-            }), 500
-
-        except ValueError as val_err:
-            return jsonify({
-                "image_id": image_id,
-                "error": str(val_err),
-                "detail": "Invalid image data (corrupt, wrong format, or blocked)"
-            }), 400
-
-        except Exception as e:
-            return jsonify({
-                "image_id": image_id,
-                "error": str(e),
-                "detail": "Unexpected processing error"
-            }), 500
     return app
