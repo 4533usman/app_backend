@@ -205,8 +205,7 @@ def create_app():
                 "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_path
             ], check=True, capture_output=True, timeout=600)
 
-            client = OpenAI (api_key="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")
-
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             with open(audio_path, "rb") as audio_file:
                 whisper_response = client.audio.translations.create(  # translations for English output
                     model="gpt-4o-mini-transcribe",
