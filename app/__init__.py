@@ -271,7 +271,7 @@ def create_app():
                 f.write(whisper_transcript)
 
         # Step 3: GPT-5.2 analysis (only if both OK)
-     gpt_analysis = "GPT analysis skipped"
+        gpt_analysis = "GPT analysis skipped"
         try:
             # Read the saved transcript (you already wrote it above)
             audio_txt_path = os.path.join(TXT_DIR, f"{video_id}_audio.txt")
