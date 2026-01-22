@@ -206,7 +206,7 @@ def create_app():
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
 
-            client = OpenAI(api_key="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")
+            client = OpenAI(api_key="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")
 
             if file_size_mb <= 25:
                 # Preferred: send original video directly (supported!)
