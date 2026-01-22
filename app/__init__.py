@@ -202,7 +202,7 @@ def create_app():
         whisper_success = False
 
         try:
-            import os  # make sure it's imported
+            # import os  # make sure it's imported
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
 
