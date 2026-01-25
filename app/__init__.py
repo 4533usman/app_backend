@@ -8,6 +8,11 @@ from PIL import Image
 import subprocess
 import time
 from openai import OpenAI
+import google.generativeai as genai
+from dotenv import load_dotenv
+load_dotenv()  # loads OPENAI_API_KEY into os.environvvv
+key = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 UPLOAD_DIR = "uploads"
 FRAMES_DIR = "frames"
 TXT_DIR = "txt_outputs"
@@ -206,7 +211,7 @@ def create_app():
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
 
-            client = OpenAI(api_key="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")
+            client = OpenAI(api_key=key)
 
             if file_size_mb <= 25:
                 # Preferred: send original video directly (supported!)
@@ -321,12 +326,66 @@ def create_app():
             gpt_analysis = f"GPT analysis failed: {str(e)}"
             print("GPT error details:", str(e))     # ← for your server logs
 
+                # Step 4: Gemini Flash refinement (GPT → Gemini)
+        gemini_analysis = "Gemini refinement skipped"
+
+        try:
+            gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+
+            gemini_prompt = (
+
+                "Design a comprehensive, vertically scrolling *Diagnostic Report* from the analysis text below, "
+                "where each numbered section is its own distinct, visually segmented panel.\n\n"
+
+                "*File Generation & Technology (Mandatory):*\n"
+                "1. Generate the output as a single, fully self-contained, mobile-responsive HTML file.\n"
+                "2. Mandatory use of Tailwind CSS and appropriate Font Awesome icons to illustrate concepts.\n"
+                "3. The final output must be optimized for vertical scrolling on mobile devices (mobile-first layout).\n\n"
+
+                "*Structural Constraints (Mandatory):*\n"
+                "1. The report must be divided into distinct, easily scrollable panels, with each panel corresponding "
+                "exactly to one of the numbered sections in the analysis text.\n"
+                "2. *MANDATORY:* Include every single word of the provided analysis text verbatim within the generated panels, "
+                "retaining all original section numbers and titles.\n\n"
+
+                "*Aesthetic Directive (Crucial Adaptation):*\n"
+                "1. The visual design (color palette, typography, textures, shadows, and overall mood) must be directly inspired "
+                "by and aesthetically reflect the theme, tone, and emotional content of the analysis text provided. "
+                "Do not default to a generic color scheme unless the text implies it.\n\n"
+
+                "================ GPT ANALYSIS START ================\n"
+                f"{gpt_analysis}\n"
+                "================ GPT ANALYSIS END ==================\n\n"
+
+                "Return ONLY the final HTML file output. Do not include explanations or markdown."
+            )
+
+
+            gemini_response = gemini_model.generate_content(
+                gemini_prompt,
+                generation_config={
+                    "temperature": 0.3,
+                    "max_output_tokens": 1200,
+                }
+            )
+
+            gemini_analysis = gemini_response.text.strip()
+
+        except Exception as e:
+            gemini_analysis = f"Gemini refinement failed: {str(e)}"
+            print("Gemini error:", str(e))
         # Then in your return jsonify:
         return jsonify({
             "video_id": video_id,
             "frames_saved": saved,
             "whisper_transcript": whisper_transcript,
-            "gpt_analysis": gpt_analysis,           # ← renamed slightly for clarity (or keep gpt_52_analysis)
-            "status": "Full pipeline complete" if "failed" not in gpt_analysis.lower() else "Partial success (GPT failed)"
+            "gpt_analysis_raw": gpt_analysis,      # optional (for debugging/logs)
+            "final_analysis": gemini_analysis,     # ✅ FINAL polished result
+            "status": (
+                "Full pipeline complete"
+                if "failed" not in gemini_analysis.lower()
+                else "Partial success"
+            )
         }), 200
+
     return app

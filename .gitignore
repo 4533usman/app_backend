@@ -4,3 +4,4 @@ __pycache__/
 # Ignore uploads and frames folders
 frames/
 dummy.py
+.env
