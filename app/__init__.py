@@ -9,7 +9,7 @@ import subprocess
 import time
 from openai import OpenAI
 import google.generativeai as genai
-from app.heplers.utils import cleanup_video_files
+from app.helpers.utils import cleanup_video_files
 from dotenv import load_dotenv
 load_dotenv()  # loads OPENAI_API_KEY into os.environvvv
 key = os.getenv("OPENAI_API_KEY")
