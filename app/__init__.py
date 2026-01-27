@@ -9,6 +9,7 @@ import subprocess
 import time
 from openai import OpenAI
 import google.generativeai as genai
+from app.heplers.utils import cleanup_video_files
 from dotenv import load_dotenv
 load_dotenv()  # loads OPENAI_API_KEY into os.environvvv
 key = os.getenv("OPENAI_API_KEY")
@@ -324,10 +325,58 @@ def create_app():
 
         except Exception as e:
             gpt_analysis = f"GPT analysis failed: {str(e)}"
-            print("GPT error details:", str(e))     # ← for your server logs
+            print("GPT error details:", str(e)) 
+            return jsonify({
+                "final_analysis": gpt_analysis,
+            }), 500
+                # ← for your server logs
 
                 # Step 4: Gemini Flash refinement (GPT → Gemini)
         gemini_analysis = "Gemini refinement skipped"
+        custom_head_style = """
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <script src="https://cdn.tailwindcss.com"></script>
+                    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+                    <style>
+                        /* Custom font import and core styles */
+                        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap');
+                        
+                        body {
+                            font-family: 'Inter', sans-serif;
+                            background-color: #000000; /* Pure Black for Console Feel */
+                            color: #e2e8f0; /* Default text color for dark mode */
+                        }
+                        .mono {
+                            font-family: 'JetBrains Mono', monospace;
+                        }
+                        /* Custom diagnostic panel styling */
+                        .diagnostic-panel {
+                            background-color: #0f172a; /* Slate-900 */
+                            border: 1px solid #1e293b;
+                            box-shadow: 0 0 15px rgba(252, 165, 165, 0.05); /* Subtle pink glow */
+                            transition: all 0.3s ease-in-out;
+                            margin-bottom: 1.5rem; /* Spacing between panels */
+                            border-radius: 0.5rem; /* Rounded corners */
+                            padding: 1.5rem;
+                        }
+                        .diagnostic-panel:hover {
+                            border-color: #ef4444; /* Red-500 on hover */
+                            transform: translateY(-2px);
+                            box-shadow: 0 5px 20px rgba(239, 68, 68, 0.15);
+                        }
+                        /* Keyframe for "Ungrounded" pulse or emphasis */
+                        @keyframes pulse-red {
+                            0%, 100% { color: #f87171; text-shadow: 0 0 5px #ef4444; }
+                            50% { color: #fee2e2; text-shadow: 0 0 10px #f87171; }
+                        }
+                        .pulse-text {
+                            animation: pulse-red 2s infinite;
+                        }
+                    </style>
+                </head>
+                """        
 
         try:
             gemini_model = genai.GenerativeModel("gemini-2.5-flash")
@@ -336,6 +385,12 @@ def create_app():
 
                 "Design a comprehensive, vertically scrolling *Diagnostic Report* from the analysis text below, "
                 "where each numbered section is its own distinct, visually segmented panel.\n\n"
+
+                "*MANDATORY STYLING & HEAD SECTION:*\n"
+                "You MUST start the HTML file with the exact <head> block provided below. "
+                "Do not create your own styles; use the classes defined in this block (like 'diagnostic-panel', 'mono', 'pulse-text') "
+                "to structure the body content.\n"
+                f"```html\n{custom_head_style}\n```\n\n"
 
                 "*File Generation & Technology (Mandatory):*\n"
                 "1. Generate the output as a single, fully self-contained, mobile-responsive HTML file.\n"
@@ -352,11 +407,7 @@ def create_app():
                 "1. The visual design (color palette, typography, textures, shadows, and overall mood) must be directly inspired "
                 "by and aesthetically reflect the theme, tone, and emotional content of the analysis text provided. "
                 "Do not default to a generic color scheme unless the text implies it.\n\n"
-
-                "================ GPT ANALYSIS START ================\n"
                 f"{gpt_analysis}\n"
-                "================ GPT ANALYSIS END ==================\n\n"
-
                 "Return ONLY the final HTML file output. Do not include explanations or markdown."
             )
 
@@ -374,18 +425,23 @@ def create_app():
         except Exception as e:
             gemini_analysis = f"Gemini refinement failed: {str(e)}"
             print("Gemini error:", str(e))
-        # Then in your return jsonify:
-        return jsonify({
-            "video_id": video_id,
-            "frames_saved": saved,
-            "whisper_transcript": whisper_transcript,
-            "gpt_analysis_raw": gpt_analysis,      # optional (for debugging/logs)
-            "final_analysis": gemini_analysis,     # ✅ FINAL polished result
-            "status": (
-                "Full pipeline complete"
-                if "failed" not in gemini_analysis.lower()
-                else "Partial success"
+            return jsonify({
+                "final_analysis": gemini_analysis,
+            }), 500
+        if (
+            gemini_analysis
+            and "failed" not in gemini_analysis.lower()
+            and "skipped" not in gemini_analysis.lower()
+        ):
+            cleanup_video_files(
+                video_id=video_id,
+                video_path=video_path,
+                frames_dir=FRAMES_DIR,
+                txt_dir=TXT_DIR
             )
+        return jsonify({
+                 # optional (for debugging/logs)
+            "final_analysis": gemini_analysis,     # ✅ FINAL polished result
         }), 200
 
     return app
