@@ -440,8 +440,9 @@ def create_app():
                 txt_dir=TXT_DIR
             )
         return jsonify({
-                 # optional (for debugging/logs)
-            "final_analysis": gemini_analysis,     # ✅ FINAL polished result
+            "florence_results": florence_results,
+            "whisper_transcript": whisper_transcript,
+            "final_analysis": gemini_analysis,
         }), 200
 
     return app
