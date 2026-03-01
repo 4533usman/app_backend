@@ -2,14 +2,16 @@ from flask import Flask, request, jsonify
 import os
 import uuid
 import math
+import shutil
+import threading
+import subprocess
 import cv2
 import torch
-import subprocess
 from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
 from openai import OpenAI
 import google.generativeai as genai
-from app.helpers.utils import cleanup_video_files
+from app.helpers.supabase_client import create_job, update_job, insert_batch, get_batches, get_job
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,11 +20,8 @@ genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 UPLOAD_DIR = "uploads"
 FRAMES_DIR = "frames"
-TXT_DIR = "txt_outputs"
-FRAME_INTERVAL_SECONDS = 2
-SEGMENT_DURATION = 60  # 1 minute per batch
-
-os.makedirs(TXT_DIR, exist_ok=True)
+SEGMENT_DURATION = 60        # seconds per batch
+FRAME_INTERVAL_SECONDS = 2   # 1 frame every N seconds
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if DEVICE.startswith("cuda") else torch.float32
@@ -40,16 +39,18 @@ processor = AutoProcessor.from_pretrained(
 )
 
 
+# -------------------------------------------------------
+# Florence helper
+# -------------------------------------------------------
 def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> str:
     if not os.path.isfile(frame_path):
         raise FileNotFoundError(f"Frame not found: {frame_path}")
-
     try:
         pil_image = Image.open(frame_path).convert("RGB")
         inputs = processor(text=task, images=pil_image, return_tensors="pt")
 
         if "pixel_values" not in inputs or inputs["pixel_values"] is None:
-            raise ValueError(f"Processor failed to extract pixel_values from {frame_path}")
+            raise ValueError(f"Processor failed on {frame_path}")
 
         inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
         if DEVICE.startswith("cuda"):
@@ -68,8 +69,7 @@ def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> 
 
         try:
             parsed = processor.post_process_generation(
-                generated_text,
-                task=task,
+                generated_text, task=task,
                 image_size=(pil_image.width, pil_image.height)
             )
             if isinstance(parsed, dict) and task in parsed:
@@ -77,26 +77,134 @@ def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> 
             if isinstance(parsed, str):
                 return parsed.strip()
             return str(parsed).strip()
-        except Exception as post_err:
-            print(f"Post-process failed for {frame_path}: {post_err}")
-            raw_caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-            return raw_caption if raw_caption else "No description generated"
+        except Exception:
+            raw = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            return raw if raw else "No description generated"
 
     except Exception as e:
         print(f"Error captioning {frame_path}: {e}")
         return f"Error: {str(e)}"
 
 
+# -------------------------------------------------------
+# Background worker — one segment at a time
+# -------------------------------------------------------
+def process_video_background(app, job_id: str, video_path: str, duration_seconds: float):
+    total_segments = math.ceil(duration_seconds / SEGMENT_DURATION)
+    client = OpenAI(api_key=key)
+
+    with app.app_context():
+        try:
+            for seg_idx in range(total_segments):
+                start_sec = seg_idx * SEGMENT_DURATION
+                seg_label = f"seg_{seg_idx + 1:03d}"
+                print(f"[{job_id}] ▶ {seg_label}  ({start_sec}s – {start_sec + SEGMENT_DURATION}s)")
+
+                # ── Florence ────────────────────────────────────────────
+                seg_frames_dir = os.path.join(FRAMES_DIR, job_id, seg_label)
+                os.makedirs(seg_frames_dir, exist_ok=True)
+
+                try:
+                    # New ffmpeg request per segment
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-ss", str(start_sec),
+                            "-t", str(SEGMENT_DURATION),
+                            "-i", video_path,
+                            "-vf", f"fps=1/{FRAME_INTERVAL_SECONDS}",
+                            "-q:v", "2",
+                            os.path.join(seg_frames_dir, "frame_%05d.jpg")
+                        ],
+                        check=True, capture_output=True, timeout=120
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(f"[{job_id}] ffmpeg frames failed for {seg_label}: {e.stderr}")
+
+                seg_captions = []
+                for frame_file in sorted(os.listdir(seg_frames_dir)):
+                    caption = florence_caption(os.path.join(seg_frames_dir, frame_file))
+                    seg_captions.append(f"{frame_file}: {caption}")
+
+                florence_text = "\n".join(seg_captions)
+
+                # Clear GPU after every segment's Florence pass
+                if DEVICE.startswith("cuda"):
+                    torch.cuda.empty_cache()
+
+                # Remove frames immediately — no longer needed
+                shutil.rmtree(seg_frames_dir, ignore_errors=True)
+
+                # ── Whisper ─────────────────────────────────────────────
+                seg_audio_path = os.path.join(UPLOAD_DIR, f"{job_id}_audio_{seg_label}.mp3")
+                whisper_text = ""
+
+                try:
+                    # New ffmpeg request per segment
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-ss", str(start_sec),
+                            "-t", str(SEGMENT_DURATION),
+                            "-i", video_path,
+                            "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+                            seg_audio_path
+                        ],
+                        check=True, capture_output=True, timeout=120
+                    )
+                    with open(seg_audio_path, "rb") as af:
+                        resp = client.audio.translations.create(
+                            model="whisper-1",
+                            file=af,
+                            response_format="text",
+                            prompt="Translate to natural English, handling Urdu-English mix code-switching naturally."
+                        )
+                    whisper_text = resp.strip()
+
+                except Exception as e:
+                    whisper_text = f"[{seg_label} transcription failed: {str(e)}]"
+                    print(f"[{job_id}] Whisper failed for {seg_label}: {e}")
+
+                finally:
+                    if os.path.exists(seg_audio_path):
+                        os.remove(seg_audio_path)
+
+                # ── Save batch to Supabase ───────────────────────────────
+                insert_batch(job_id, seg_idx, florence_text, whisper_text)
+                print(f"[{job_id}] ✓ {seg_label} saved to Supabase")
+
+            # All segments done
+            update_job(job_id, status="completed")
+            print(f"[{job_id}] ✓ All {total_segments} segments complete — ready to finalize")
+
+        except Exception as e:
+            print(f"[{job_id}] Background processing failed: {e}")
+            update_job(job_id, status="failed", error=str(e))
+
+        finally:
+            # Clean up uploaded video and any leftover frames
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            job_frames_dir = os.path.join(FRAMES_DIR, job_id)
+            if os.path.exists(job_frames_dir):
+                shutil.rmtree(job_frames_dir, ignore_errors=True)
+
+
+# -------------------------------------------------------
+# App factory
+# -------------------------------------------------------
 def create_app():
     app = Flask(__name__)
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(FRAMES_DIR, exist_ok=True)
 
+    # ── Health ─────────────────────────────────────────────────────────
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "RunPod API running"}), 200
 
+    # ── Endpoint 1: Upload + start background processing ───────────────
     @app.route("/upload-video", methods=["POST"])
     def upload_video():
         if "video" not in request.files:
@@ -107,7 +215,7 @@ def create_app():
         video_path = os.path.join(UPLOAD_DIR, f"{video_id}_{video.filename}")
         video.save(video_path)
 
-        # --- Get video duration ---
+        # Get duration
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             return jsonify({"error": "Cannot open video"}), 500
@@ -122,119 +230,71 @@ def create_app():
         duration_seconds = total_frame_count / fps
         total_segments = math.ceil(duration_seconds / SEGMENT_DURATION)
 
-        print(f"[{video_id}] Duration: {duration_seconds:.1f}s → {total_segments} segment(s)")
+        # Create job row in Supabase
+        job_id = create_job()
 
-        # --- Accumulators ---
-        all_florence_captions = []
-        all_whisper_transcripts = []
+        # Launch background thread — one segment at a time
+        thread = threading.Thread(
+            target=process_video_background,
+            args=(app, job_id, video_path, duration_seconds),
+            daemon=True
+        )
+        thread.start()
+
+        return jsonify({
+            "job_id": job_id,
+            "total_segments": total_segments,
+            "status": "processing",
+            "message": f"Video split into {total_segments} segment(s) of {SEGMENT_DURATION}s each. Call POST /finalize/<job_id> when ready."
+        }), 202
+
+    # ── Endpoint 2: Finalize — GPT + Gemini after all batches saved ────
+    @app.route("/finalize/<job_id>", methods=["POST"])
+    def finalize(job_id):
+        # Check job status first
+        job = get_job(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+
+        if job["status"] == "processing":
+            return jsonify({
+                "job_id": job_id,
+                "status": "processing",
+                "message": "Batches are still being processed. Try again shortly."
+            }), 202
+
+        if job["status"] == "failed":
+            return jsonify({
+                "job_id": job_id,
+                "status": "failed",
+                "error": job.get("error", "Unknown error during processing")
+            }), 500
+
+        # Fetch all saved batches
+        batches = get_batches(job_id)
+        if not batches:
+            return jsonify({"error": "No batch data found for this job"}), 404
+
+        # Combine all segment results
+        all_florence = []
+        all_whisper = []
+        for batch in batches:
+            seg_num = batch["segment_index"] + 1
+            minutes = batch["segment_index"]
+            all_florence.append(f"[Segment {seg_num}]\n{batch['florence_captions']}")
+            all_whisper.append(f"[{minutes}:00] {batch['whisper_transcript']}")
+
+        full_visual = "\n\n".join(all_florence)
+        full_transcript = "\n".join(all_whisper)
+
         client = OpenAI(api_key=key)
 
-        # -----------------------------------------------
-        # Step 1+2: Per-segment Florence + Whisper
-        # -----------------------------------------------
-        for seg_idx in range(total_segments):
-            start_sec = seg_idx * SEGMENT_DURATION
-            seg_label = f"seg_{seg_idx + 1:03d}"
-            print(f"[{video_id}] Processing {seg_label} (start={start_sec}s)")
-
-            # -- Florence: extract frames via ffmpeg for this segment --
-            seg_frames_dir = os.path.join(FRAMES_DIR, video_id, seg_label)
-            os.makedirs(seg_frames_dir, exist_ok=True)
-
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-ss", str(start_sec),
-                        "-t", str(SEGMENT_DURATION),
-                        "-i", video_path,
-                        "-vf", f"fps=1/{FRAME_INTERVAL_SECONDS}",
-                        "-q:v", "2",
-                        os.path.join(seg_frames_dir, "frame_%05d.jpg")
-                    ],
-                    check=True, capture_output=True, timeout=120
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"[{video_id}] ffmpeg frame extract failed for {seg_label}: {e.stderr}")
-
-            seg_captions = []
-            for frame_file in sorted(os.listdir(seg_frames_dir)):
-                frame_path = os.path.join(seg_frames_dir, frame_file)
-                caption = florence_caption(frame_path)
-                seg_captions.append(f"{seg_label}/{frame_file}: {caption}")
-
-            # Save this segment's Florence output
-            florence_txt = os.path.join(TXT_DIR, f"{video_id}_florence_{seg_label}.txt")
-            with open(florence_txt, "w", encoding="utf-8") as f:
-                f.write("\n".join(seg_captions))
-
-            all_florence_captions.extend(seg_captions)
-
-            # Clear GPU memory after each segment
-            if DEVICE.startswith("cuda"):
-                torch.cuda.empty_cache()
-
-            # -- Whisper: extract audio for this segment --
-            seg_audio_path = os.path.join(UPLOAD_DIR, f"{video_id}_audio_{seg_label}.mp3")
-            seg_transcript = ""
-
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-ss", str(start_sec),
-                        "-t", str(SEGMENT_DURATION),
-                        "-i", video_path,
-                        "-vn", "-acodec", "libmp3lame", "-q:a", "2",
-                        seg_audio_path
-                    ],
-                    check=True, capture_output=True, timeout=120
-                )
-
-                with open(seg_audio_path, "rb") as af:
-                    whisper_response = client.audio.translations.create(
-                        model="whisper-1",
-                        file=af,
-                        response_format="text",
-                        prompt="Translate to natural English, handling Urdu-English mix code-switching naturally."
-                    )
-                seg_transcript = whisper_response.strip()
-
-            except Exception as e:
-                seg_transcript = f"[{seg_label} transcription failed: {str(e)}]"
-                print(f"[{video_id}] Whisper failed for {seg_label}: {e}")
-
-            finally:
-                if os.path.exists(seg_audio_path):
-                    os.remove(seg_audio_path)
-
-            # Save this segment's Whisper output
-            whisper_txt = os.path.join(TXT_DIR, f"{video_id}_whisper_{seg_label}.txt")
-            with open(whisper_txt, "w", encoding="utf-8") as f:
-                f.write(seg_transcript)
-
-            minutes = start_sec // 60
-            seconds = start_sec % 60
-            all_whisper_transcripts.append(f"[{minutes}:{seconds:02d}] {seg_transcript}")
-
-        # Combine all segments into final TXT files
-        full_visual = "\n".join(all_florence_captions)
-        full_transcript = "\n".join(all_whisper_transcripts)
-
-        with open(os.path.join(TXT_DIR, f"{video_id}_visual.txt"), "w", encoding="utf-8") as f:
-            f.write(full_visual)
-
-        with open(os.path.join(TXT_DIR, f"{video_id}_audio.txt"), "w", encoding="utf-8") as f:
-            f.write(full_transcript)
-
-        # -----------------------------------------------
-        # Step 3: GPT analysis on combined results
-        # -----------------------------------------------
+        # ── GPT ────────────────────────────────────────────────────────
         gpt_analysis = "GPT analysis skipped"
         try:
             combined_prompt = (
-                f"Visual Description from Florence-2 (frame captions):\n{full_visual}\n\n"
-                f"Audio Transcript from Whisper:\n{full_transcript}\n\n"
+                f"Visual Description from Florence-2 (frame captions per segment):\n{full_visual}\n\n"
+                f"Audio Transcript from Whisper (per segment):\n{full_transcript}\n\n"
                 "You are an expert video analyst. Provide:\n"
                 "1. A detailed, coherent English summary of the video content.\n"
                 "2. Key topics, main ideas, and any important points discussed.\n"
@@ -255,18 +315,13 @@ def create_app():
                 temperature=0.4,
                 max_completion_tokens=1200
             )
-
             gpt_analysis = gpt_response.choices[0].message.content.strip()
 
         except Exception as e:
-            gpt_analysis = f"GPT analysis failed: {str(e)}"
             print("GPT error:", str(e))
-            return jsonify({"final_analysis": gpt_analysis}), 500
+            return jsonify({"job_id": job_id, "final_analysis": f"GPT failed: {str(e)}"}), 500
 
-        # -----------------------------------------------
-        # Step 4: Gemini HTML generation
-        # -----------------------------------------------
-        gemini_analysis = "Gemini refinement skipped"
+        # ── Gemini ─────────────────────────────────────────────────────
         custom_head_style = """
                 <head>
                     <meta charset="UTF-8">
@@ -275,24 +330,16 @@ def create_app():
                     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
                     <style>
                         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap');
-                        body {
-                            font-family: 'Inter', sans-serif;
-                            background-color: #000000;
-                            color: #e2e8f0;
-                        }
+                        body { font-family: 'Inter', sans-serif; background-color: #000000; color: #e2e8f0; }
                         .mono { font-family: 'JetBrains Mono', monospace; }
                         .diagnostic-panel {
-                            background-color: #0f172a;
-                            border: 1px solid #1e293b;
+                            background-color: #0f172a; border: 1px solid #1e293b;
                             box-shadow: 0 0 15px rgba(252, 165, 165, 0.05);
-                            transition: all 0.3s ease-in-out;
-                            margin-bottom: 1.5rem;
-                            border-radius: 0.5rem;
-                            padding: 1.5rem;
+                            transition: all 0.3s ease-in-out; margin-bottom: 1.5rem;
+                            border-radius: 0.5rem; padding: 1.5rem;
                         }
                         .diagnostic-panel:hover {
-                            border-color: #ef4444;
-                            transform: translateY(-2px);
+                            border-color: #ef4444; transform: translateY(-2px);
                             box-shadow: 0 5px 20px rgba(239, 68, 68, 0.15);
                         }
                         @keyframes pulse-red {
@@ -304,9 +351,9 @@ def create_app():
                 </head>
                 """
 
+        gemini_analysis = "Gemini refinement skipped"
         try:
             gemini_model = genai.GenerativeModel("gemini-2.5-flash")
-
             gemini_prompt = (
                 "Design a comprehensive, vertically scrolling *Diagnostic Report* from the analysis text below, "
                 "where each numbered section is its own distinct, visually segmented panel.\n\n"
@@ -318,15 +365,12 @@ def create_app():
                 "*File Generation & Technology (Mandatory):*\n"
                 "1. Generate the output as a single, fully self-contained, mobile-responsive HTML file.\n"
                 "2. Mandatory use of Tailwind CSS and appropriate Font Awesome icons to illustrate concepts.\n"
-                "3. The final output must be optimized for vertical scrolling on mobile devices (mobile-first layout).\n\n"
+                "3. The final output must be optimized for vertical scrolling on mobile devices.\n\n"
                 "*Structural Constraints (Mandatory):*\n"
-                "1. The report must be divided into distinct, easily scrollable panels, with each panel corresponding "
-                "exactly to one of the numbered sections in the analysis text.\n"
-                "2. *MANDATORY:* Include every single word of the provided analysis text verbatim within the generated panels, "
-                "retaining all original section numbers and titles.\n\n"
-                "*Aesthetic Directive (Crucial Adaptation):*\n"
-                "1. The visual design must be directly inspired by and aesthetically reflect the theme, tone, and emotional content "
-                "of the analysis text provided.\n\n"
+                "1. Each panel corresponds exactly to one numbered section in the analysis text.\n"
+                "2. *MANDATORY:* Include every single word of the provided analysis text verbatim.\n\n"
+                "*Aesthetic Directive:*\n"
+                "1. The visual design must reflect the theme and emotional content of the analysis.\n\n"
                 f"{gpt_analysis}\n"
                 "Return ONLY the final HTML file output. Do not include explanations or markdown."
             )
@@ -335,29 +379,18 @@ def create_app():
                 gemini_prompt,
                 generation_config={"temperature": 0.3, "max_output_tokens": 8192}
             )
-
             gemini_analysis = gemini_response.text.strip()
 
         except Exception as e:
-            gemini_analysis = f"Gemini refinement failed: {str(e)}"
             print("Gemini error:", str(e))
-            return jsonify({"final_analysis": gemini_analysis}), 500
+            return jsonify({"job_id": job_id, "final_analysis": f"Gemini failed: {str(e)}"}), 500
 
-        if (
-            gemini_analysis
-            and "failed" not in gemini_analysis.lower()
-            and "skipped" not in gemini_analysis.lower()
-        ):
-            cleanup_video_files(
-                video_id=video_id,
-                video_path=video_path,
-                frames_dir=FRAMES_DIR,
-                txt_dir=TXT_DIR
-            )
+        # Save final result to Supabase
+        update_job(job_id, response_payload={"html": gemini_analysis})
 
         return jsonify({
-            "video_id": video_id,
-            "segments_processed": total_segments,
+            "job_id": job_id,
+            "segments_processed": len(batches),
             "whisper_transcript": full_transcript,
             "final_analysis": gemini_analysis,
         }), 200
