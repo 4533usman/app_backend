@@ -32,15 +32,31 @@ def update_job(job_id: str, **fields):
     sb.table("api_jobs").update(fields).eq("id", job_id).execute()
 
 
-def insert_batch(job_id: str, segment_index: int, florence_captions: str, whisper_transcript: str):
+def insert_batch(job_id: str, segment_index: int, florence_captions: str, audio_path: str = None):
     """Insert one processed segment row into video_batches."""
     sb = get_supabase()
     sb.table("video_batches").insert({
         "job_id": job_id,
         "segment_index": segment_index,
         "florence_captions": florence_captions,
-        "whisper_transcript": whisper_transcript,
+        "audio_path": audio_path,   # Supabase Storage path for edge function to use
     }).execute()
+
+
+def upload_audio_segment(job_id: str, seg_label: str, local_path: str) -> str:
+    """
+    Upload a local audio file to Supabase Storage bucket 'audio-segments'.
+    Returns the storage path: {job_id}/{seg_label}.mp3
+    """
+    sb = get_supabase()
+    storage_path = f"{job_id}/{seg_label}.mp3"
+    with open(local_path, "rb") as f:
+        sb.storage.from_("audio-segments").upload(
+            storage_path,
+            f,
+            file_options={"content-type": "audio/mpeg"}
+        )
+    return storage_path
 
 
 def get_batches(job_id: str) -> list:
