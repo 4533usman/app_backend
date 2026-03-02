@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import os
-import uuid
 import math
 import shutil
 import threading
@@ -9,7 +8,7 @@ import cv2
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
-from app.helpers.supabase_client import create_job, update_job, insert_batch
+from app.helpers.supabase_client import update_job, insert_batch
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -164,7 +163,7 @@ def process_video_background(app, job_id: str, video_path: str, duration_seconds
                 print(f"[{job_id}] ✓ {seg_label} saved to Supabase")
 
             # All segments done — trigger edge function automatically
-            update_job(job_id, status="completed")
+            # update_job(job_id, status="completed")
             print(f"[{job_id}] ✓ All {total_segments} segments complete — triggering edge function")
 
             edge_url = os.getenv("SUPABASE_EDGE_FUNCTION_URL")  # e.g. https://<project>.supabase.co/functions/v1/finalize
@@ -221,8 +220,13 @@ def create_app():
         if "video" not in request.files:
             return jsonify({"error": "No video provided"}), 400
 
+        # job_id created by frontend — receive it here
+        job_id = request.form.get("job_id")
+        if not job_id:
+            return jsonify({"error": "job_id is required"}), 400
+
         video = request.files["video"]
-        video_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{video.filename}")
+        video_path = os.path.join(UPLOAD_DIR, f"{job_id}_{video.filename}")
         video.save(video_path)
 
         # Get duration
@@ -239,9 +243,6 @@ def create_app():
 
         duration_seconds = total_frame_count / fps
         total_segments = math.ceil(duration_seconds / SEGMENT_DURATION)
-
-        # Create job in Supabase — returns the job_id
-        job_id = create_job()
 
         # Launch Florence-only background thread
         thread = threading.Thread(
