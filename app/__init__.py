@@ -82,6 +82,63 @@ def florence_caption(frame_path: str, task: str = "<MORE_DETAILED_CAPTION>") -> 
 
 
 # -------------------------------------------------------
+# Download video from URL then process (avoids Edge Function timeout)
+# -------------------------------------------------------
+def process_video_from_url(app, job_id: str, video_url: str, video_path: str):
+    import requests as req_lib
+
+    MAX_SIZE = 1000 * 1024 * 1024  # 1000 MB
+
+    with app.app_context():
+        try:
+            print(f"[{job_id}] Starting video download from URL...")
+            with req_lib.get(video_url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                content_length = int(r.headers.get("Content-Length", 0))
+                if content_length:
+                    print(f"[{job_id}] Video size: {content_length / (1024 * 1024):.1f} MB")
+                if content_length > MAX_SIZE:
+                    print(f"[{job_id}] Rejected: video exceeds 1000 MB limit")
+                    update_job(job_id, status="failed", error="Video exceeds 1000 MB limit")
+                    return
+                bytes_written = 0
+                with open(video_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                        bytes_written += len(chunk)
+                        if bytes_written > MAX_SIZE:
+                            os.remove(video_path)
+                            print(f"[{job_id}] Rejected mid-download: exceeded 1000 MB limit")
+                            update_job(job_id, status="failed", error="Video exceeds 1000 MB limit")
+                            return
+                        f.write(chunk)
+                        print(f"[{job_id}] Downloaded {bytes_written / (1024 * 1024):.1f} MB...")
+            print(f"[{job_id}] Download complete — {bytes_written / (1024 * 1024):.1f} MB saved to {video_path}")
+        except Exception as e:
+            print(f"[{job_id}] Download failed: {e}")
+            update_job(job_id, status="failed", error=f"Failed to download video: {str(e)}")
+            return
+
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            print(f"[{job_id}] Cannot open video with OpenCV")
+            update_job(job_id, status="failed", error="Cannot open video")
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+
+        if fps <= 0:
+            print(f"[{job_id}] Cannot determine video FPS")
+            update_job(job_id, status="failed", error="Cannot determine video FPS")
+            return
+
+        duration_seconds = total_frame_count / fps
+        print(f"[{job_id}] Video info — duration: {duration_seconds:.1f}s, fps: {fps}, frames: {int(total_frame_count)}")
+        process_video_background(app, job_id, video_path, duration_seconds)
+
+
+# -------------------------------------------------------
 # Background worker — Florence only, audio upload per segment
 # -------------------------------------------------------
 def process_video_background(app, job_id: str, video_path: str, duration_seconds: float):
@@ -205,6 +262,7 @@ def process_video_background(app, job_id: str, video_path: str, duration_seconds
 # -------------------------------------------------------
 def create_app():
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = 1000 * 1024 * 1024  # 1000 MB
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(FRAMES_DIR, exist_ok=True)
@@ -217,17 +275,45 @@ def create_app():
     # ── Upload video + start Florence background processing ────────────
     @app.route("/upload-video", methods=["POST"])
     def upload_video():
-        if "video" not in request.files:
-            return jsonify({"error": "No video provided"}), 400
+        content_type = request.content_type or ""
 
-        # job_id created by frontend — receive it here
-        job_id = request.form.get("job_id")
-        if not job_id:
-            return jsonify({"error": "job_id is required"}), 400
+        if "application/json" in content_type:
+            # Edge Function path: receives { video_url, job_id }
+            data = request.get_json(silent=True) or {}
+            job_id = data.get("job_id")
+            video_url = data.get("video_url")
 
-        video = request.files["video"]
-        video_path = os.path.join(UPLOAD_DIR, f"{job_id}_{video.filename}")
-        video.save(video_path)
+            if not job_id:
+                return jsonify({"error": "job_id is required"}), 400
+            if not video_url:
+                return jsonify({"error": "video_url is required"}), 400
+
+            # Return immediately — download + process happens in background
+            video_path = os.path.join(UPLOAD_DIR, f"{job_id}_video.mp4")
+            thread = threading.Thread(
+                target=process_video_from_url,
+                args=(app, job_id, video_url, video_path),
+                daemon=True
+            )
+            thread.start()
+
+            return jsonify({
+                "job_id": job_id,
+                "status": "processing",
+                "message": "Video download and processing started in background."
+            }), 202
+        else:
+            # Direct multipart upload path
+            if "video" not in request.files:
+                return jsonify({"error": "No video provided"}), 400
+
+            job_id = request.form.get("job_id")
+            if not job_id:
+                return jsonify({"error": "job_id is required"}), 400
+
+            video = request.files["video"]
+            video_path = os.path.join(UPLOAD_DIR, f"{job_id}_{video.filename}")
+            video.save(video_path)
 
         # Get duration
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
