@@ -220,7 +220,7 @@ def process_video_background(app, job_id: str, video_path: str, duration_seconds
                 print(f"[{job_id}] ✓ {seg_label} saved to Supabase")
 
             # All segments done — trigger edge function automatically
-            update_job(job_id, status="completed")
+            # update_job(job_id, status="completed")
             print(f"[{job_id}] ✓ All {total_segments} segments complete — triggering edge function")
 
             edge_url = os.getenv("SUPABASE_EDGE_FUNCTION_URL")  # e.g. https://<project>.supabase.co/functions/v1/finalize
